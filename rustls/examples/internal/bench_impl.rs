@@ -4,10 +4,11 @@
 // etc. because it's unstable at the time of writing.
 
 use std::io::{self, Read, Write};
-use std::mem;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{mem, thread};
 
 use clap::{Parser, ValueEnum};
 use pki_types::pem::PemObject;
@@ -38,6 +39,7 @@ pub fn main() {
     let options = Options {
         work_multiplier: args.multiplier,
         api: args.api,
+        threads: args.threads,
     };
 
     match args.command() {
@@ -92,6 +94,9 @@ struct Args {
         help = "Multiplies the length of every test by the given float value"
     )]
     multiplier: f64,
+
+    #[arg(long, default_value = "1", help = "Number of threads to use")]
+    threads: NonZeroUsize,
 
     #[arg(long, value_enum, default_value_t = Api::Both, help = "Choose buffered or unbuffered API")]
     api: Api,
@@ -220,24 +225,47 @@ fn bench_handshake(
     );
 
     if options.api.use_buffered() {
-        report_handshake_result(
-            "handshakes",
-            params,
-            clientauth,
-            resume,
-            rounds,
-            bench_handshake_buffered(rounds, resume, client_config.clone(), server_config.clone()),
-        );
+        let threads = (0..options.threads.into())
+            .map(|_| {
+                let client_config = client_config.clone();
+                let server_config = server_config.clone();
+                thread::spawn(move || {
+                    bench_handshake_buffered(rounds, resume, client_config, server_config)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = threads
+            .into_iter()
+            .map(|thr| thr.join().unwrap())
+            .collect::<Vec<Timings>>();
+
+        report_handshake_result("handshakes", params, clientauth, resume, rounds, results);
     }
 
     if options.api.use_unbuffered() {
+        let threads = (0..options.threads.into())
+            .map(|_| {
+                let client_config = client_config.clone();
+                let server_config = server_config.clone();
+                thread::spawn(move || {
+                    bench_handshake_unbuffered(rounds, resume, client_config, server_config)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = threads
+            .into_iter()
+            .map(|thr| thr.join().unwrap())
+            .collect::<Vec<Timings>>();
+
         report_handshake_result(
             "handshakes-unbuffered",
             params,
             clientauth,
             resume,
             rounds,
-            bench_handshake_unbuffered(rounds, resume, client_config, server_config),
+            results,
         );
     }
 }
@@ -346,10 +374,10 @@ fn report_handshake_result(
     clientauth: ClientAuth,
     resume: ResumptionParam,
     rounds: u64,
-    timings: Timings,
+    timings: Vec<Timings>,
 ) {
-    println!(
-        "{}\t{:?}\t{:?}\t{:?}\tclient\t{}\t{}\t{:.2}\thandshake/s",
+    print!(
+        "{}\t{:?}\t{:?}\t{:?}\tclient\t{}\t{}\t",
         variant,
         params.version,
         params.key_type,
@@ -360,10 +388,11 @@ fn report_handshake_result(
             "server-auth"
         },
         resume.label(),
-        (rounds as f64) / timings.client
     );
-    println!(
-        "{}\t{:?}\t{:?}\t{:?}\tserver\t{}\t{}\t{:.2}\thandshake/s",
+
+    report_timings(&timings, rounds, |t| t.client);
+    print!(
+        "{}\t{:?}\t{:?}\t{:?}\tserver\t{}\t{}\t",
         variant,
         params.version,
         params.key_type,
@@ -374,11 +403,39 @@ fn report_handshake_result(
             "server-auth"
         },
         resume.label(),
-        (rounds as f64) / timings.server
     );
+
+    report_timings(&timings, rounds, |t| t.server);
 }
 
-#[derive(Debug, Default)]
+fn report_timings(thread_timings: &[Timings], rounds: u64, which: impl Fn(&Timings) -> f64) {
+    let thread_count = thread_timings.len();
+    match thread_count {
+        // maintain old output for --threads=1
+        1 => println!(
+            "{:.2}\thandshake/s",
+            (rounds as f64) / which(&thread_timings[0])
+        ),
+        _ => {
+            let mut total_rate = 0.;
+            print!("threads\t{}\t", thread_count);
+
+            for t in thread_timings.iter() {
+                let rate = (rounds as f64) / which(t);
+                total_rate += rate;
+                print!("{:.2}\t", rate);
+            }
+
+            println!(
+                "total\t{:.2}\tper-thread\t{:.2}\thandshakes/s",
+                total_rate,
+                total_rate / (thread_count as f64)
+            );
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default)]
 struct Timings {
     client: f64,
     server: f64,
@@ -715,6 +772,7 @@ impl ResumptionParam {
 struct Options {
     work_multiplier: f64,
     api: Api,
+    threads: NonZeroUsize,
 }
 
 impl Options {
