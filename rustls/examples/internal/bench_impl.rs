@@ -414,7 +414,7 @@ fn report_handshake_result(
         resume.label(),
     );
 
-    report_timings(&timings, rounds, |t| t.client);
+    report_timings("handshakes/s", &timings, rounds as f64, |t| t.client);
     print!(
         "{}\t{:?}\t{:?}\t{:?}\tserver\t{}\t{}\t",
         variant,
@@ -429,31 +429,38 @@ fn report_handshake_result(
         resume.label(),
     );
 
-    report_timings(&timings, rounds, |t| t.server);
+    report_timings("handshakes/s", &timings, rounds as f64, |t| t.server);
 }
 
-fn report_timings(thread_timings: &[Timings], rounds: u64, which: impl Fn(&Timings) -> f64) {
+fn report_timings(
+    units: &str,
+    thread_timings: &[Timings],
+    work_per_thread: f64,
+    which: impl Fn(&Timings) -> f64,
+) {
     let thread_count = thread_timings.len();
     match thread_count {
         // maintain old output for --threads=1
         1 => println!(
-            "{:.2}\thandshake/s",
-            (rounds as f64) / which(&thread_timings[0])
+            "{:.2}\t{}",
+            work_per_thread / which(&thread_timings[0]),
+            units,
         ),
         _ => {
             let mut total_rate = 0.;
             print!("threads\t{}\t", thread_count);
 
             for t in thread_timings.iter() {
-                let rate = (rounds as f64) / which(t);
+                let rate = work_per_thread / which(t);
                 total_rate += rate;
                 print!("{:.2}\t", rate);
             }
 
             println!(
-                "total\t{:.2}\tper-thread\t{:.2}\thandshakes/s",
+                "total\t{:.2}\tper-thread\t{:.2}\t{}",
                 total_rate,
-                total_rate / (thread_count as f64)
+                total_rate / (thread_count as f64),
+                units,
             );
         }
     }
@@ -491,14 +498,24 @@ fn bench_bulk(
     let rounds = total_data / plaintext_size;
 
     if options.api.use_buffered() {
+        let threads = (0..options.threads.into())
+            .map(|_| {
+                let client_config = client_config.clone();
+                let server_config = server_config.clone();
+                thread::spawn(move || {
+                    bench_bulk_buffered(client_config, server_config, plaintext_size, rounds)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = threads
+            .into_iter()
+            .map(|thr| thr.join().unwrap())
+            .collect::<Vec<Timings>>();
+
         report_bulk_result(
             "bulk",
-            bench_bulk_buffered(
-                client_config.clone(),
-                server_config.clone(),
-                plaintext_size,
-                rounds,
-            ),
+            results,
             plaintext_size,
             rounds,
             max_fragment_size,
@@ -507,9 +524,24 @@ fn bench_bulk(
     }
 
     if options.api.use_unbuffered() {
+        let threads = (0..options.threads.into())
+            .map(|_| {
+                let client_config = client_config.clone();
+                let server_config = server_config.clone();
+                thread::spawn(move || {
+                    bench_bulk_unbuffered(client_config, server_config, plaintext_size, rounds)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = threads
+            .into_iter()
+            .map(|thr| thr.join().unwrap())
+            .collect::<Vec<Timings>>();
+
         report_bulk_result(
             "bulk-unbuffered",
-            bench_bulk_unbuffered(client_config, server_config, plaintext_size, rounds),
+            results,
             plaintext_size,
             rounds,
             max_fragment_size,
@@ -523,29 +555,27 @@ fn bench_bulk_buffered(
     server_config: Arc<ServerConfig>,
     plaintext_size: u64,
     rounds: u64,
-) -> (f64, f64) {
+) -> Timings {
     let server_name = "localhost".try_into().unwrap();
     let mut client = ClientConnection::new(client_config, server_name).unwrap();
     client.set_buffer_limit(None);
     let mut server = ServerConnection::new(server_config).unwrap();
     server.set_buffer_limit(None);
 
+    let mut timings = Timings::default();
     let mut buffers = TempBuffers::new();
     do_handshake(&mut buffers, &mut client, &mut server);
 
-    let mut time_send = 0f64;
-    let mut time_recv = 0f64;
-
     let buf = vec![0; plaintext_size as usize];
     for _ in 0..rounds {
-        time(&mut time_send, || {
+        time(&mut timings.server, || {
             server.writer().write_all(&buf).unwrap();
         });
 
-        time_recv += transfer(&mut buffers, &mut server, &mut client, Some(buf.len()));
+        timings.client += transfer(&mut buffers, &mut server, &mut client, Some(buf.len()));
     }
 
-    (time_send, time_recv)
+    timings
 }
 
 fn bench_bulk_unbuffered(
@@ -553,7 +583,7 @@ fn bench_bulk_unbuffered(
     server_config: Arc<ServerConfig>,
     plaintext_size: u64,
     rounds: u64,
-) -> (f64, f64) {
+) -> Timings {
     let server_name = "localhost".try_into().unwrap();
     let mut client = Unbuffered::new_client(
         UnbufferedClientConnection::new(client_config, server_name).unwrap(),
@@ -563,28 +593,27 @@ fn bench_bulk_unbuffered(
 
     client.handshake(&mut server);
 
-    let mut time_send = 0f64;
-    let mut time_recv = 0f64;
+    let mut timings = Timings::default();
 
     let buf = vec![0; plaintext_size as usize];
     for _ in 0..rounds {
-        time(&mut time_send, || {
+        time(&mut timings.server, || {
             server.write(&buf);
         });
 
         server.swap_buffers(&mut client);
 
-        time(&mut time_recv, || {
+        time(&mut timings.client, || {
             client.read_and_discard(buf.len());
         });
     }
 
-    (time_send, time_recv)
+    timings
 }
 
 fn report_bulk_result(
     variant: &str,
-    (time_send, time_recv): (f64, f64),
+    timings: Vec<Timings>,
     plaintext_size: u64,
     rounds: u64,
     max_fragment_size: Option<usize>,
@@ -597,22 +626,23 @@ fn report_bulk_result(
             .unwrap_or_else(|| "default".to_string())
     );
     let total_mbs = ((plaintext_size * rounds) as f64) / (1024. * 1024.);
-    println!(
-        "{}\t{:?}\t{:?}\t{}\tsend\t{:.2}\tMB/s",
+    print!(
+        "{}\t{:?}\t{:?}\t{}\tsend\t",
         variant,
         params.version,
         params.ciphersuite.suite(),
         mfs_str,
-        total_mbs / time_send
     );
-    println!(
-        "{}\t{:?}\t{:?}\t{}\trecv\t{:.2}\tMB/s",
+    report_timings("MB/s", &timings, total_mbs, |t| t.server);
+
+    print!(
+        "{}\t{:?}\t{:?}\t{}\trecv\t",
         variant,
         params.version,
         params.ciphersuite.suite(),
         mfs_str,
-        total_mbs / time_recv
     );
+    report_timings("MB/s", &timings, total_mbs, |t| t.client);
 }
 
 fn bench_memory(params: &BenchmarkParam, conn_count: u64) {
